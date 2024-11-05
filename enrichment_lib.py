@@ -957,10 +957,72 @@ def send_to_elastic(asset):
             api_key=config['ELASTIC']['TOKEN'],
             verify_certs=False
         )
-
+        
+        ecs_data = adaptar_a_ecs(asset)
         documents = [
             { "index": { "_index": config['ELASTIC']['INDEX_NAME'], "_id": asset["id"]}},
             asset,
         ]
 
         client.bulk(operations=documents, pipeline="ent-search-generic-ingestion")
+# Función para adaptar los datos al formato ECS
+def adaptar_a_ecs(asset):
+    raw_timestamp = asset.get("enrichment_data", {}).get("timestamp")
+    if raw_timestamp:
+        # Convertir el timestamp de milisegundos a ISO 8601 en UTC
+        formatted_timestamp = datetime.fromtimestamp(raw_timestamp / 1000).isoformat() + "Z"
+    else:
+        formatted_timestamp = None
+
+
+    # Si destination_hosts es None, lo inicializamos como una lista vacía
+    destination_hosts = asset.get("enrichment_data", {}).get("destination_hosts", [])
+    if destination_hosts is None:
+        destination_hosts = []
+
+    ips = [host for host in destination_hosts if is_ip(host)]
+    domains = [host for host in destination_hosts if not is_ip(host)]
+    
+    ecs_data = {
+        "@timestamp": formatted_timestamp,
+        "event": {
+            "created": raw_timestamp,
+            "category": "network",
+            "action": "enrichment",
+            "outcome": "success" if asset.get("enriched", False) else "failure",
+        },
+        "host": {
+            "name": asset.get("name") or "Unknown Host",
+            "ip": [asset.get("ip")] if asset.get("ip") else None,
+            "mac": [asset.get("mac")] if asset.get("mac") else None,
+            "type": asset.get("tipo"),
+        },
+        "network": {
+            "protocol": "tcp",
+            "community_id": asset.get("enrichment_data", {}).get("ja3_fingerprints"),
+            "source": {
+                "ip": asset.get("enrichment_data", {}).get("source_ip")
+            },
+            "destination": {
+                "ip": ips if ips else None,
+                "domain": domains if domains else None
+            }
+        },
+        "user_agent": {
+            "original": asset.get("enrichment_data", {}).get("user_agents"),
+        },
+        "fingerprint": {
+            "ja3": asset.get("enrichment_data", {}).get("ja3_fingerprints"),
+        },
+        "threat": {
+            "indicator": {
+                "url": {
+                    "domain": asset.get("enrichment_data", {}).get("hostname"),
+                }
+            }
+        },
+        "tags": ["enriquecido" if asset.get("enriched") else "no_enriquecido"],
+    }
+
+    # Eliminar campos vacíos
+    return {k: v for k, v in ecs_data.items() if v is not None}

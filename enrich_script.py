@@ -20,5 +20,6 @@ if __name__ == "__main__":
 
     for asset in list_assets:
         write_data(asset["id"], asset)
+        adaptar_a_ecs(asset)
         send_to_elastic(asset)
         logger.info (asset)
