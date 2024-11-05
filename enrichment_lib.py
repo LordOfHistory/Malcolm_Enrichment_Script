@@ -199,6 +199,7 @@ def get_destination_hosts(ip):
                 verify=False,
                 timeout=10  # Establecer un tiempo máximo de espera de 10 segundos por solicitud
             )
+            print("##############################################################################################",response)
         except requests.exceptions.RequestException as e:
             logger.info(f"Request failed: {e}")
             return []
@@ -497,6 +498,7 @@ def get_real_pcaps(expression, gen_pcap=False):
         if response.status_code == 200:
             # Intenta parsear la respuesta como JSON
             sessions = response.json().get("data", [])
+            logger.debug("##################################",sessions)
             logger.info(f"Total Sessions Found in Arkime: {len(sessions)}")
 
             # Extraer los IDs de sesión
