@@ -1,3 +1,4 @@
+import re
 import requests
 import logging
 import configparser
@@ -13,6 +14,8 @@ import pyshark
 from io import BytesIO
 from elasticsearch import Elasticsearch
 import json
+from datetime import datetime
+
 
 # Importamos la configuración
 config = configparser.ConfigParser()
@@ -30,6 +33,13 @@ warnings.simplefilter('ignore', InsecureRequestWarning)
 session = requests.Session()   
 headers = {"Content-Type": "application/json"}
 auth=HTTPBasicAuth(config['NGINX']['USER'], config['NGINX']['PASSWORD'])
+
+# Configuración de cliente Elasticsearch
+es_client = Elasticsearch(
+    config['ELASTIC']['URL'],
+    api_key=config['ELASTIC']['TOKEN'],
+    verify_certs=False
+)
 
 #############################################################################################
 # Funciones de enriquecimiento
@@ -961,20 +971,34 @@ def send_to_elastic(asset):
         ecs_data = adaptar_a_ecs(asset)
         documents = [
             { "index": { "_index": config['ELASTIC']['INDEX_NAME'], "_id": asset["id"]}},
-            asset,
+            ecs_data,
         ]
+        response = client.bulk(operations=documents)
 
-        client.bulk(operations=documents, pipeline="ent-search-generic-ingestion")
+        #client.bulk(operations=documents, pipeline="ent-search-generic-ingestion")
+        
+        if response.get("errors"):
+            for item in response["items"]:
+                if "error" in item["index"]:
+                    error_info = item["index"]["error"]
+                    logger.error(f"Error al enviar documento {item['index']['_id']}: {error_info}")
+        else:
+            logger.info(f"Documento {asset['id']} enviado exitosamente a Elasticsearch en formato ECS")
+        
+# Función para verificar si una cadena es una IP
+def is_ip(host):
+    ip_pattern = re.compile(r"^(?:[0-9]{1,3}\.){3}[0-9]{1,3}$")
+    return ip_pattern.match(host) is not None
+
 # Función para adaptar los datos al formato ECS
 def adaptar_a_ecs(asset):
     raw_timestamp = asset.get("enrichment_data", {}).get("timestamp")
     if raw_timestamp:
-        # Convertir el timestamp de milisegundos a ISO 8601 en UTC
-        formatted_timestamp = datetime.fromtimestamp(raw_timestamp / 1000).isoformat() + "Z"
+        from datetime import datetime as dt
+        formatted_timestamp = dt.fromtimestamp(raw_timestamp / 1000).isoformat() + "Z"
     else:
         formatted_timestamp = None
-
-
+        
     # Si destination_hosts es None, lo inicializamos como una lista vacía
     destination_hosts = asset.get("enrichment_data", {}).get("destination_hosts", [])
     if destination_hosts is None:
@@ -984,6 +1008,7 @@ def adaptar_a_ecs(asset):
     domains = [host for host in destination_hosts if not is_ip(host)]
     
     ecs_data = {
+        "id": asset.get("id"),  # Incluye el ID original
         "@timestamp": formatted_timestamp,
         "event": {
             "created": raw_timestamp,
@@ -1026,3 +1051,84 @@ def adaptar_a_ecs(asset):
 
     # Eliminar campos vacíos
     return {k: v for k, v in ecs_data.items() if v is not None}
+
+# Función para crear índice en Elasticsearch con un mapeo específico
+def create_index_with_mapping(es_client, index_name):
+    # Definición del mapeo
+    index_name = config['ELASTIC']['INDEX_NAME']
+    mapping = {
+        "mappings": {
+            "properties": {
+                "@timestamp": {
+                    "type": "date",
+                    "format": "strict_date_optional_time||epoch_millis"
+                },
+                "host": {
+                    "properties": {
+                        "name": {
+                            "type": "keyword"  # Define host.name como keyword para búsquedas y filtros
+                        },
+                        "ip": {"type": "ip"},
+                        "type": {"type": "keyword"}
+                    }
+                },
+                "user_agent": {
+                    "properties": {
+                        "original": {"type": "keyword"}  # Definir como keyword para visualizaciones
+                    }
+                },
+                "network": {
+                    "properties": {
+                        "protocol": {"type": "keyword"},
+                        "community_id": {"type": "keyword"},
+                        "source": {
+                            "properties": {
+                                "ip": {"type": "ip"}  # Definir source.ip como tipo IP
+                            }
+                        },
+                        "destination": {
+                            "properties": {
+                                "ip": {"type": "ip"},
+                                "domain": {"type": "keyword"}
+                            }
+                        }
+                    }
+                },
+                "fingerprint": {
+                    "properties": {
+                        "ja3": {"type": "keyword"}
+                    }
+                },
+                "threat": {
+                    "properties": {
+                        "indicator": {
+                            "properties": {
+                                "url": {
+                                    "properties": {
+                                        "domain": {"type": "keyword"}
+                                    }
+                                }
+                            }
+                        }
+                    }
+                },
+                "event": {
+                    "properties": {
+                        "action": {"type": "keyword"},
+                        "created": {"type": "date", "format": "epoch_millis"},
+                        "category": {"type": "keyword"},
+                        "outcome": {"type": "keyword"}
+                    }
+                },
+                "tags": {"type": "keyword"}
+            }
+        }
+    }
+
+    # Verificar si el índice ya existe y eliminarlo si es necesario
+    if es_client.indices.exists(index=index_name):
+        es_client.indices.delete(index=index_name)
+        logger.info(f"Índice '{index_name}' eliminado y recreado con el mapeo ECS.")
+    
+    es_client.indices.create(index=index_name, body=mapping)
+    logger.info(f"Índice '{index_name}' creado con el mapeo ECS.")
