@@ -1,3 +1,4 @@
 config.ini
 develop
+*.pcap
 __pycache__
