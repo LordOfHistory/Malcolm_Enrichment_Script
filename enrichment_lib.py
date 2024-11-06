@@ -961,29 +961,30 @@ def generar_json():
             break
 # Función que escribe los assets actualizados en elastic
 def send_to_elastic(asset):
-    if (config['ELASTIC']['URL'] != None):
+    """
+    Envía el asset convertido a formato ECS a Elasticsearch.
+    """
+    if config['ELASTIC']['URL']:
         client = Elasticsearch(
             config['ELASTIC']['URL'],
             api_key=config['ELASTIC']['TOKEN'],
             verify_certs=False
         )
         
-        ecs_data = adaptar_a_ecs(asset)
         documents = [
-            { "index": { "_index": config['ELASTIC']['INDEX_NAME'], "_id": asset["id"]}},
-            ecs_data,
+            { "index": { "_index": config['ELASTIC']['INDEX_NAME'], "_id": asset.get("id") }},
+            asset
         ]
         response = client.bulk(operations=documents)
 
-        #client.bulk(operations=documents, pipeline="ent-search-generic-ingestion")
-        
         if response.get("errors"):
             for item in response["items"]:
                 if "error" in item["index"]:
                     error_info = item["index"]["error"]
                     logger.error(f"Error al enviar documento {item['index']['_id']}: {error_info}")
         else:
-            logger.info(f"Documento {asset['id']} enviado exitosamente a Elasticsearch en formato ECS")
+            logger.info(f"Documento {asset.get('id')} enviado exitosamente a Elasticsearch")
+
         
 # Función para verificar si una cadena es una IP
 def is_ip(host):
@@ -991,144 +992,101 @@ def is_ip(host):
     return ip_pattern.match(host) is not None
 
 # Función para adaptar los datos al formato ECS
-def adaptar_a_ecs(asset):
-    raw_timestamp = asset.get("enrichment_data", {}).get("timestamp")
-    if raw_timestamp:
-        from datetime import datetime as dt
-        formatted_timestamp = dt.fromtimestamp(raw_timestamp / 1000).isoformat() + "Z"
-    else:
-        formatted_timestamp = None
-        
-    # Si destination_hosts es None, lo inicializamos como una lista vacía
-    destination_hosts = asset.get("enrichment_data", {}).get("destination_hosts", [])
-    if destination_hosts is None:
-        destination_hosts = []
-
-    ips = [host for host in destination_hosts if is_ip(host)]
-    domains = [host for host in destination_hosts if not is_ip(host)]
-    
-    ecs_data = {
-        "id": asset.get("id"),  # Incluye el ID original
-        "@timestamp": formatted_timestamp,
-        "event": {
-            "created": raw_timestamp,
-            "category": "network",
-            "action": "enrichment",
-            "outcome": "success" if asset.get("enriched", False) else "failure",
-        },
-        "host": {
-            "name": asset.get("name") or "Unknown Host",
-            "ip": [asset.get("ip")] if asset.get("ip") else None,
-            "mac": [asset.get("mac")] if asset.get("mac") else None,
-            "type": asset.get("tipo"),
-        },
-        "network": {
-            "protocol": "tcp",
-            "community_id": asset.get("enrichment_data", {}).get("ja3_fingerprints"),
-            "source": {
-                "ip": asset.get("enrichment_data", {}).get("source_ip")
-            },
-            "destination": {
-                "ip": ips if ips else None,
-                "domain": domains if domains else None
-            }
-        },
-        "user_agent": {
-            "original": asset.get("enrichment_data", {}).get("user_agents"),
-        },
-        "fingerprint": {
-            "ja3": asset.get("enrichment_data", {}).get("ja3_fingerprints"),
-        },
-        "threat": {
-            "indicator": {
-                "url": {
-                    "domain": asset.get("enrichment_data", {}).get("hostname"),
+ecs_mapping = {
+    "mappings": {
+        "dynamic": "strict",  # Esto desactiva el mapeo dinámico
+        "properties": {
+            "@timestamp": { "type": "date" },
+            "host": {
+                "properties": {
+                    "name": { "type": "keyword" },
+                    "ip": { "type": "ip" },
+                    "mac": { "type": "keyword" },
+                    "type": { "type": "keyword" }
                 }
-            }
-        },
-        "tags": ["enriquecido" if asset.get("enriched") else "no_enriquecido"],
-    }
-
-    # Eliminar campos vacíos
-    return {k: v for k, v in ecs_data.items() if v is not None}
-
-# Función para crear índice en Elasticsearch con un mapeo específico
-def create_index_with_mapping(es_client, index_name):
-    # Definición del mapeo
-    index_name = config['ELASTIC']['INDEX_NAME']
-    mapping = {
-        "mappings": {
-            "properties": {
-                "@timestamp": {
-                    "type": "date",
-                    "format": "strict_date_optional_time||epoch_millis"
-                },
-                "host": {
-                    "properties": {
-                        "name": {
-                            "type": "keyword"  # Define host.name como keyword para búsquedas y filtros
-                        },
-                        "ip": {"type": "ip"},
-                        "type": {"type": "keyword"}
-                    }
-                },
-                "user_agent": {
-                    "properties": {
-                        "original": {"type": "keyword"}  # Definir como keyword para visualizaciones
-                    }
-                },
-                "network": {
-                    "properties": {
-                        "protocol": {"type": "keyword"},
-                        "community_id": {"type": "keyword"},
-                        "source": {
-                            "properties": {
-                                "ip": {"type": "ip"}  # Definir source.ip como tipo IP
-                            }
-                        },
-                        "destination": {
-                            "properties": {
-                                "ip": {"type": "ip"},
-                                "domain": {"type": "keyword"}
-                            }
+            },
+            "network": {
+                "properties": {
+                    "protocol": { "type": "keyword" },
+                    "community_id": { "type": "keyword" },
+                    "source": {
+                        "properties": {
+                            "ip": { "type": "ip" }
+                        }
+                    },
+                    "destination": {
+                        "properties": {
+                            "ip": { "type": "ip" },
+                            "domain": { "type": "keyword" }
                         }
                     }
-                },
-                "fingerprint": {
-                    "properties": {
-                        "ja3": {"type": "keyword"}
-                    }
-                },
-                "threat": {
-                    "properties": {
-                        "indicator": {
-                            "properties": {
-                                "url": {
-                                    "properties": {
-                                        "domain": {"type": "keyword"}
-                                    }
+                }
+            },
+            "user_agent": {
+                "properties": {
+                    "original": { "type": "keyword" }
+                }
+            },
+            "fingerprint": {
+                "properties": {
+                    "ja3": { "type": "keyword" }
+                }
+            },
+            "threat": {
+                "properties": {
+                    "indicator": {
+                        "properties": {
+                            "url": {
+                                "properties": {
+                                    "domain": { "type": "keyword" }
                                 }
                             }
                         }
                     }
-                },
-                "event": {
-                    "properties": {
-                        "action": {"type": "keyword"},
-                        "created": {"type": "date", "format": "epoch_millis"},
-                        "category": {"type": "keyword"},
-                        "outcome": {"type": "keyword"}
-                    }
-                },
-                "tags": {"type": "keyword"}
-            }
+                }
+            },
+            "tags": { "type": "keyword" }
         }
     }
+}
 
-    # Verificar si el índice ya existe y eliminarlo si es necesario
-    if es_client.indices.exists(index=index_name):
-        es_client.indices.delete(index=index_name)
-        logger.info(f"Índice '{index_name}' eliminado y recreado con el mapeo ECS.")
-    
-    es_client.indices.create(index=index_name, body=mapping)
-    logger.info(f"Índice '{index_name}' creado con el mapeo ECS.")
+# Crear el índice con el mapeo ECS si no existe
+index_name = config['ELASTIC']['INDEX_NAME']
+if not es_client.indices.exists(index=index_name):
+    es_client.indices.create(index=index_name, body=ecs_mapping)
+    logging.info(f"Índice {index_name} creado con el mapeo ECS.")
+
+
+# Función para crear índice en Elasticsearch con un mapeo específico
+def adaptar_a_ecs(asset):
+    """
+    Convierte el asset a un formato ECS estándar.
+    """
+    ecs_asset = {
+        "@timestamp": datetime.now().isoformat(),
+        "event": {
+            "created": datetime.now().timestamp() * 1000,  # Epoch timestamp en milisegundos
+            "category": "network",
+            "action": "enrichment",
+            "outcome": "success" if asset.get("enriched") else "failure"
+        },
+        "host": {
+            "name": asset.get("name", "Unknown"),
+            "ip": [asset.get("ip")],
+            "mac": [asset.get("mac")],
+            "type": asset.get("tipo")
+        },
+        "network": {
+            "protocol": "tcp",  # Ejemplo, ajustar según corresponda
+            "community_id": None,  # Puedes agregar más información relevante si tienes
+            "source": {
+                "ip": asset["enrichment_data"].get("source_ip")
+            },
+            "destination": {
+                "ip": asset["enrichment_data"].get("destination_ip"),
+                "domain": asset["enrichment_data"].get("destination_hosts")
+            }
+        },
+        "tags": ["enriquecido"] if asset.get("enriched") else []
+    }
+    return ecs_asset
